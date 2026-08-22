@@ -1,0 +1,218 @@
+name: Deploy Django to EC2 - Production
+
+on:
+  push:
+    branches:
+      - main
+jobs:
+  docker-build-push:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/fast-api-youtub-playlist-downloader:prod,${{ secrets.DOCKERHUB_USERNAME }}/fast-api-youtub-playlist-downloader:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/fast-api-youtub-playlist-downloader:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/fast-api-youtub-playlist-downloader:buildcache,mode=max
+
+  update-environment:
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Clean up stale files on server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST_PROD }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            rm -rf docker-compose.fast-api-youtub-playlist-downloader.prod.yml nginx-fast-api-youtub-playlist-downloader-prod.conf
+            echo "Cleanup done"
+
+      - name: Copy deployment files to server
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.EC2_HOST_PROD }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.fast-api-youtub-playlist-downloader.prod.yml,nginx-fast-api-youtub-playlist-downloader-prod.conf"
+          target: "./"
+
+      - name: Update Environment Variables on Server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST_PROD }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "Creating .env.fast-api-youtub-playlist-downloader.prod file on server"
+            cat <<EOF > .env.fast-api-youtub-playlist-downloader.prod
+            # Core Django
+
+            # ==========================================
+            # ⬇️ ADD YOUR CUSTOM ENVIRONMENT VARIABLES ⬇️
+            # ==========================================
+            # Map your GitHub Secrets to your server's .env file here:
+            # THIRD_PARTY_API_KEY=${{ secrets.THIRD_PARTY_API_KEY }}
+            EOF
+            
+            
+            echo "DATABASE_URL=${{ secrets.DATABASE_PROD_URL }}" >> .env.fast-api-youtub-playlist-downloader.prod
+            
+            
+            echo "Environment variables update completed"
+
+  deploy-docker:
+    runs-on: ubuntu-latest
+    needs: [update-environment]
+    env:
+      SETUP_SSL: false # Set to 'true' to enable SSL setup with Certbot and Nginx
+    steps:
+      - name: Deploy and restart Docker containers
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST_PROD }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Stop and disable legacy systemd services to prevent conflicts
+            echo "Stopping legacy systemd services..."
+            sudo systemctl stop daphne celery celerybeat pgbouncer || true
+            sudo systemctl disable daphne celery celerybeat pgbouncer || true
+
+            # Install Docker if not present
+            if ! command -v docker &> /dev/null; then
+              echo "Docker not found, installing..."
+              sudo apt-get update
+              sudo apt-get install -y ca-certificates curl gnupg lsb-release
+              sudo mkdir -p /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              sudo systemctl enable docker
+              sudo systemctl start docker
+              sudo usermod -aG docker $USER
+            fi
+
+            # Create host directories for static and media volumes to avoid Docker root permissions issues
+            echo "Creating host directories for static and media files..."
+            sudo mkdir -p /var/www/fast-api-youtub-playlist-downloader-prod/static
+            sudo mkdir -p /var/www/fast-api-youtub-playlist-downloader-prod/media
+            sudo chown -R $USER:www-data /var/www/fast-api-youtub-playlist-downloader-prod
+            sudo chmod -R 775 /var/www/fast-api-youtub-playlist-downloader-prod
+
+            # Ensure we can pull the image from Docker Hub
+            echo "Logging in to Docker Hub on remote host"
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin || true
+
+            # Pull the latest Docker image(s)
+            # docker compose will read .env.fast-api-youtub-playlist-downloader.prod for ${DOCKER_IMAGE} substitution
+            sudo docker compose -p fast_api_youtub_playlist_downloader_prod --env-file .env.fast-api-youtub-playlist-downloader.prod -f docker-compose.fast-api-youtub-playlist-downloader.prod.yml pull || docker compose -p fast_api_youtub_playlist_downloader_prod --env-file .env.fast-api-youtub-playlist-downloader.prod -f docker-compose.fast-api-youtub-playlist-downloader.prod.yml pull || true
+
+            # Start containers (will gracefully recreate only changed containers)
+            sudo docker compose -p fast_api_youtub_playlist_downloader_prod --env-file .env.fast-api-youtub-playlist-downloader.prod -f docker-compose.fast-api-youtub-playlist-downloader.prod.yml up -d --no-build || docker compose -p fast_api_youtub_playlist_downloader_prod --env-file .env.fast-api-youtub-playlist-downloader.prod -f docker-compose.fast-api-youtub-playlist-downloader.prod.yml up -d --no-build
+
+            # Wait a moment
+            sleep 5
+
+            
+            # Optional: Run alembic migrations if they use it (uncomment if using Alembic)
+            # sudo docker compose -p fast_api_youtub_playlist_downloader_prod --env-file .env.fast-api-youtub-playlist-downloader.prod -f docker-compose.fast-api-youtub-playlist-downloader.prod.yml exec -T web alembic upgrade head || true
+            
+
+            # Add any custom deployment commands here (e.g. cache clearing, custom scripts)
+            # sudo docker compose -p fast_api_youtub_playlist_downloader_prod --env-file .env.fast-api-youtub-playlist-downloader.prod -f docker-compose.fast-api-youtub-playlist-downloader.prod.yml exec -T web python manage.py your_custom_command
+
+            # Clean up unused images and logs
+            sudo docker image prune -f
+            sudo journalctl --vacuum-time=7d
+            echo "Deployment completed"
+
+      - name: Setup nginx configuration and SSL
+        if: env.SETUP_SSL == 'true'
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST_PROD }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "Setting up nginx configuration and SSL..."
+            sudo apt-get update
+            sudo apt-get install -y certbot python3-certbot-nginx curl
+
+            # Create necessary directories for Let's Encrypt
+            sudo mkdir -p /var/www/html/.well-known/acme-challenge
+            sudo chown -R www-data:www-data /var/www/html
+
+            # Verify nginx configuration file exists and copy to sites-available
+            if [ -f "$HOME/nginx-fast-api-youtub-playlist-downloader-prod.conf" ]; then
+              echo "Found nginx configuration file in home, copying to sites-available"
+              sudo cp "$HOME/nginx-fast-api-youtub-playlist-downloader-prod.conf" /etc/nginx/sites-available/fast-api-youtub-playlist-downloader-prod
+            else
+              echo "Error: $HOME/nginx-fast-api-youtub-playlist-downloader-prod.conf file not found"
+              ls -la $HOME/nginx-fast-api-youtub-playlist-downloader-prod.conf* || echo "No nginx files found in home"
+              exit 1
+            fi
+
+            # Remove only production symlink if it exists to avoid conflicts (keep dev intact)
+            sudo rm -f /etc/nginx/sites-enabled/fast-api-youtub-playlist-downloader-prod
+            sudo rm -f /etc/nginx/sites-enabled/api.example.com
+            
+            # Ensure default nginx site is disabled
+            sudo rm -f /etc/nginx/sites-enabled/default
+
+            # Enable the production site
+            sudo ln -sf /etc/nginx/sites-available/fast-api-youtub-playlist-downloader-prod /etc/nginx/sites-enabled/fast-api-youtub-playlist-downloader-prod
+
+            # Test nginx configuration
+            echo "Testing nginx configuration..."
+            sudo nginx -t
+
+            # Show configuration details for debugging
+            echo "Nginx configuration details:"
+            sudo nginx -T | grep -A 20 -B 5 "fast-api-youtub-playlist-downloader-prod" || echo "No fast-api-youtub-playlist-downloader-prod configuration found in nginx -T output"
+
+            # Reload nginx if configuration is valid
+            if sudo nginx -t; then
+              sudo systemctl restart nginx
+              echo "Nginx configuration updated and reloaded successfully"
+              ls -la /etc/nginx/sites-enabled/ | grep fast-api-youtub-playlist-downloader || echo "Warning: fast-api-youtub-playlist-downloader site not found in sites-enabled"
+            else
+              echo "Nginx configuration test failed"
+              echo "Showing nginx error log:"
+              sudo tail -20 /var/log/nginx/error.log || echo "Could not read nginx error log"
+              exit 1
+            fi
+
+            # Wait for the application to be fully deployed before setting up SSL
+            echo "Waiting for application to be ready..."
+            sleep 30
+
+            # Setup SSL certificates with Certbot
+            echo "Setting up SSL certificates..."
+            sudo certbot --nginx -d api.example.com --non-interactive --agree-tos --email nwaforglory6@gmail.com --redirect || echo "SSL setup failed, continuing with HTTP"
+
+            # Setup automatic renewal
+            sudo systemctl enable certbot.timer
+            sudo systemctl start certbot.timer
+
+            echo "Nginx and SSL setup completed successfully"

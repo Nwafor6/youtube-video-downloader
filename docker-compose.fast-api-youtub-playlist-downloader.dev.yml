@@ -1,0 +1,19 @@
+services:
+  web:
+    image: ${DOCKER_IMAGE}
+    restart: always
+    ports:
+      - "8008:8000"
+    volumes:
+      - /var/www/fast-api-youtub-playlist-downloader-dev/static:/app/static
+      - /var/www/fast-api-youtub-playlist-downloader-dev/media:/app/media
+    env_file:
+      - .env.fast-api-youtub-playlist-downloader.dev
+    networks:
+      - fast_api_youtub_playlist_downloader_dev
+
+volumes:
+
+networks:
+  fast_api_youtub_playlist_downloader_dev:
+    name: fast_api_youtub_playlist_downloader_dev
