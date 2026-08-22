@@ -12,8 +12,6 @@ services:
     networks:
       - fast_api_youtub_playlist_downloader_prod
 
-volumes:
-
 networks:
   fast_api_youtub_playlist_downloader_prod:
     name: fast_api_youtub_playlist_downloader_prod

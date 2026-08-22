@@ -3,7 +3,7 @@ name: Deploy Django to EC2 - Develop
 on:
   push:
     branches:
-      - testing-deploying-vps
+      - main
 
 jobs:
   docker-build-push:
