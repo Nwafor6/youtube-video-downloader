@@ -1,9 +1,9 @@
-name: Deploy Django to EC2 - Develop
+name: Deploy to EC2 - Dev
 
 on:
   push:
     branches:
-      - testing-deploying-vps
+      - main
 
 jobs:
   docker-build-push:
@@ -41,27 +41,27 @@ jobs:
       - name: Clean up stale files on server
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            rm -rf docker-compose.fast-api-youtub-playlist-downloader.dev.yml nginx-fast-api-youtub-playlist-downloader-dev.conf
+            rm -rf docker-compose.fast-api-youtub-playlist-downloader.dev.yml Caddyfile.dev.dev
             echo "Cleanup done"
 
       - name: Copy deployment files to server
         uses: appleboy/scp-action@master
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "docker-compose.fast-api-youtub-playlist-downloader.dev.yml,nginx-fast-api-youtub-playlist-downloader-dev.conf"
+          source: "docker-compose.fast-api-youtub-playlist-downloader.dev.yml,Caddyfile.dev.dev"
           target: "./"
 
       - name: Update Environment Variables on Server
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             echo "Creating .env.fast-api-youtub-playlist-downloader.dev file on server"
@@ -84,20 +84,63 @@ jobs:
   deploy-docker:
     runs-on: ubuntu-latest
     needs: [update-environment]
-    env:
-      SETUP_SSL: false # Set to 'true' to enable SSL setup with Certbot and Nginx
     steps:
       - name: Deploy and restart Docker containers
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             # Stop and disable legacy systemd services to prevent conflicts
             echo "Stopping legacy systemd services..."
             sudo systemctl stop daphne celery celerybeat pgbouncer || true
             sudo systemctl disable daphne celery celerybeat pgbouncer || true
+
+            # Install Docker if not present
+            if ! command -v docker &> /dev/null; then
+              echo "Docker not found, installing..."
+              sudo apt-get update
+              sudo apt-get install -y ca-certificates curl gnupg lsb-release
+              sudo mkdir -p /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              sudo systemctl enable docker
+              sudo systemctl start docker
+              sudo usermod -aG docker $USER
+            fi
+
+            # Bootstrap Global Caddy Gateway
+            echo "Checking global gateway setup..."
+            sudo docker network inspect gateway >/dev/null 2>&1 || sudo docker network create gateway
+            
+            sudo mkdir -p /opt/gateway
+            cat << 'EOF' | sudo tee /opt/gateway/docker-compose.dev.yml > /dev/null
+            services:
+              caddy:
+                image: lucaslorentz/caddy-docker-proxy:alpine
+                ports:
+                  - "80:80"
+                  - "443:443"
+                environment:
+                  - CADDY_INGRESS_NETWORKS=gateway
+                networks:
+                  - gateway
+                volumes:
+                  - /var/run/docker.sock:/var/run/docker.sock
+                  - gateway_caddy_data:/data
+                restart: unless-stopped
+
+            networks:
+              gateway:
+                external: true
+
+            volumes:
+              gateway_caddy_data:
+            EOF
+            sudo docker compose -f /opt/gateway/docker-compose.dev.yml up -d
 
             # Create host directories for static and media volumes to avoid Docker root permissions issues
             echo "Creating host directories for static and media files..."
@@ -132,73 +175,3 @@ jobs:
             sudo docker image prune -f
             sudo journalctl --vacuum-time=7d
             echo "Deployment completed"
-
-      - name: Setup nginx configuration and SSL
-        if: env.SETUP_SSL == 'true'
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            echo "Setting up nginx configuration and SSL..."
-            sudo apt-get update
-            sudo apt-get install -y certbot python3-certbot-nginx curl
-
-            # Create necessary directories for Let's Encrypt
-            sudo mkdir -p /var/www/html/.well-known/acme-challenge
-            sudo chown -R www-data:www-data /var/www/html
-
-            # Verify nginx configuration file exists and copy to sites-available
-            if [ -f "$HOME/nginx-fast-api-youtub-playlist-downloader-dev.conf" ]; then
-              echo "Found nginx configuration file in home, copying to sites-available"
-              sudo cp "$HOME/nginx-fast-api-youtub-playlist-downloader-dev.conf" /etc/nginx/sites-available/fast-api-youtub-playlist-downloader-dev
-            else
-              echo "Error: $HOME/nginx-fast-api-youtub-playlist-downloader-dev.conf file not found"
-              ls -la $HOME/nginx-fast-api-youtub-playlist-downloader-dev.conf* || echo "No nginx files found in home"
-              exit 1
-            fi
-
-            # Remove only dev symlink if it exists to avoid conflicts (keep prod intact)
-            sudo rm -f /etc/nginx/sites-enabled/fast-api-youtub-playlist-downloader-dev
-            sudo rm -f /etc/nginx/sites-enabled/api-dev.example.com
-            
-            # Ensure default nginx site is disabled
-            sudo rm -f /etc/nginx/sites-enabled/default
-
-            # Enable the dev site
-            sudo ln -sf /etc/nginx/sites-available/fast-api-youtub-playlist-downloader-dev /etc/nginx/sites-enabled/fast-api-youtub-playlist-downloader-dev
-
-            # Test nginx configuration
-            echo "Testing nginx configuration..."
-            sudo nginx -t
-
-            # Show configuration details for debugging
-            echo "Nginx configuration details:"
-            sudo nginx -T | grep -A 20 -B 5 "fast-api-youtub-playlist-downloader-dev" || echo "No fast-api-youtub-playlist-downloader-dev configuration found in nginx -T output"
-
-            # Reload nginx if configuration is valid
-            if sudo nginx -t; then
-              sudo systemctl restart nginx
-              echo "Nginx configuration updated and reloaded successfully"
-              ls -la /etc/nginx/sites-enabled/ | grep fast-api-youtub-playlist-downloader || echo "Warning: fast-api-youtub-playlist-downloader site not found in sites-enabled"
-            else
-              echo "Nginx configuration test failed"
-              echo "Showing nginx error log:"
-              sudo tail -20 /var/log/nginx/error.log || echo "Could not read nginx error log"
-              exit 1
-            fi
-
-            # Wait for the application to be fully deployed before setting up SSL
-            echo "Waiting for application to be ready..."
-            sleep 30
-
-            # Setup SSL certificates with Certbot
-            echo "Setting up SSL certificates..."
-            sudo certbot --nginx -d api-dev.example.com --non-interactive --agree-tos --email admin@example.com --redirect || echo "SSL setup failed, continuing with HTTP"
-
-            # Setup automatic renewal
-            sudo systemctl enable certbot.timer
-            sudo systemctl start certbot.timer
-
-            echo "Nginx and SSL setup completed successfully"
