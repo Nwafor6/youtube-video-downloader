@@ -1,0 +1,177 @@
+name: Deploy to EC2 - Dev
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  docker-build-push:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/fast-api-youtub-playlist-downloader:dev,${{ secrets.DOCKERHUB_USERNAME }}/fast-api-youtub-playlist-downloader:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/fast-api-youtub-playlist-downloader:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/fast-api-youtub-playlist-downloader:buildcache,mode=max
+
+  update-environment:
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Clean up stale files on server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            rm -rf docker-compose.fast-api-youtub-playlist-downloader.dev.yml Caddyfile.dev.dev
+            echo "Cleanup done"
+
+      - name: Copy deployment files to server
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.fast-api-youtub-playlist-downloader.dev.yml,Caddyfile.dev.dev"
+          target: "./"
+
+      - name: Update Environment Variables on Server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "Creating .env.fast-api-youtub-playlist-downloader.dev file on server"
+            cat <<EOF > .env.fast-api-youtub-playlist-downloader.dev
+            DOCKER_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/fast-api-youtub-playlist-downloader:dev
+            
+            # ==========================================
+            # ⬇️ ADD YOUR CUSTOM ENVIRONMENT VARIABLES ⬇️
+            # ==========================================
+            # Map your GitHub Secrets to your server's .env file here:
+            # THIRD_PARTY_API_KEY=${{ secrets.THIRD_PARTY_API_KEY }}
+            EOF
+            
+            
+            echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env.fast-api-youtub-playlist-downloader.dev
+            
+            
+            echo "Environment variables update completed"
+
+  deploy-docker:
+    runs-on: ubuntu-latest
+    needs: [update-environment]
+    steps:
+      - name: Deploy and restart Docker containers
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Stop and disable legacy systemd services to prevent conflicts
+            echo "Stopping legacy systemd services..."
+            sudo systemctl stop daphne celery celerybeat pgbouncer || true
+            sudo systemctl disable daphne celery celerybeat pgbouncer || true
+
+            # Install Docker if not present
+            if ! command -v docker &> /dev/null; then
+              echo "Docker not found, installing..."
+              sudo apt-get update
+              sudo apt-get install -y ca-certificates curl gnupg lsb-release
+              sudo mkdir -p /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              sudo systemctl enable docker
+              sudo systemctl start docker
+              sudo usermod -aG docker $USER
+            fi
+
+            # Bootstrap Global Caddy Gateway
+            echo "Checking global gateway setup..."
+            sudo docker network inspect gateway >/dev/null 2>&1 || sudo docker network create gateway
+            
+            sudo mkdir -p /opt/gateway
+            cat << 'EOF' | sudo tee /opt/gateway/docker-compose.dev.yml > /dev/null
+            services:
+              caddy:
+                image: lucaslorentz/caddy-docker-proxy:alpine
+                ports:
+                  - "80:80"
+                  - "443:443"
+                environment:
+                  - CADDY_INGRESS_NETWORKS=gateway
+                networks:
+                  - gateway
+                volumes:
+                  - /var/run/docker.sock:/var/run/docker.sock
+                  - gateway_caddy_data:/data
+                restart: unless-stopped
+
+            networks:
+              gateway:
+                external: true
+
+            volumes:
+              gateway_caddy_data:
+            EOF
+            sudo docker compose -f /opt/gateway/docker-compose.dev.yml up -d
+
+            # Create host directories for static and media volumes to avoid Docker root permissions issues
+            echo "Creating host directories for static and media files..."
+            sudo mkdir -p /var/www/fast-api-youtub-playlist-downloader-dev/static
+            sudo mkdir -p /var/www/fast-api-youtub-playlist-downloader-dev/media
+            sudo chown -R $USER:www-data /var/www/fast-api-youtub-playlist-downloader-dev
+            sudo chmod -R 775 /var/www/fast-api-youtub-playlist-downloader-dev
+
+            # Ensure we can pull the image from Docker Hub
+            echo "Logging in to Docker Hub on remote host"
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin || true
+
+            # Pull the latest Docker image(s)
+            # docker compose will read .env.fast-api-youtub-playlist-downloader.dev for ${DOCKER_IMAGE} substitution
+            sudo docker compose -p fast_api_youtub_playlist_downloader_dev --env-file .env.fast-api-youtub-playlist-downloader.dev -f docker-compose.fast-api-youtub-playlist-downloader.dev.yml pull || docker compose -p fast_api_youtub_playlist_downloader_dev --env-file .env.fast-api-youtub-playlist-downloader.dev -f docker-compose.fast-api-youtub-playlist-downloader.dev.yml pull || true
+
+            # Start containers (will gracefully recreate only changed containers)
+            sudo docker compose -p fast_api_youtub_playlist_downloader_dev --env-file .env.fast-api-youtub-playlist-downloader.dev -f docker-compose.fast-api-youtub-playlist-downloader.dev.yml up -d --no-build || docker compose -p fast_api_youtub_playlist_downloader_dev --env-file .env.fast-api-youtub-playlist-downloader.dev -f docker-compose.fast-api-youtub-playlist-downloader.dev.yml up -d --no-build
+
+            # Wait a moment
+            sleep 5
+
+            
+            # Optional: Run alembic migrations if they use it (uncomment if using Alembic)
+            # sudo docker compose -p fast_api_youtub_playlist_downloader_dev --env-file .env.fast-api-youtub-playlist-downloader.dev -f docker-compose.fast-api-youtub-playlist-downloader.dev.yml exec -T web alembic upgrade head || true
+            
+
+            # Add any custom deployment commands here (e.g. cache clearing, custom scripts)
+            # sudo docker compose -p fast_api_youtub_playlist_downloader_dev --env-file .env.fast-api-youtub-playlist-downloader.dev -f docker-compose.fast-api-youtub-playlist-downloader.dev.yml exec -T web python manage.py your_custom_command
+
+            # Clean up unused images and logs
+            sudo docker image prune -f
+            sudo journalctl --vacuum-time=7d
+            echo "Deployment completed"

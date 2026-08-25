@@ -1,0 +1,34 @@
+services:
+  caddy:
+    image: caddy:alpine
+    restart: always
+    labels:
+      caddy: api.example.com
+      caddy.reverse_proxy: "{{upstreams 80}}"
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile
+      - /var/www/fast-api-youtub-playlist-downloader-dev/static:/app/static
+      - /var/www/fast-api-youtub-playlist-downloader-dev/media:/app/media
+    networks:
+      - fast_api_youtub_playlist_downloader_dev
+      - gateway
+    depends_on:
+      - web
+
+  web:
+    image: ${DOCKER_IMAGE}
+    restart: always
+    volumes:
+      - /var/www/fast-api-youtub-playlist-downloader-dev/static:/app/static
+      - /var/www/fast-api-youtub-playlist-downloader-dev/media:/app/media
+    env_file:
+      - .env.fast-api-youtub-playlist-downloader.dev
+    networks:
+      - fast_api_youtub_playlist_downloader_dev
+
+networks:
+  fast_api_youtub_playlist_downloader_dev:
+    name: fast_api_youtub_playlist_downloader_dev
+  gateway:
+    external: true
+
